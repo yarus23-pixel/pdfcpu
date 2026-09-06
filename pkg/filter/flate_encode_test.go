@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pdfcpu/pdfcpu/pkg/filter"
 )
@@ -78,6 +79,19 @@ func TestFlateEncodePreservesEarlierStreams(t *testing.T) {
 	}
 }
 
+type gatedReader struct {
+	reader   *bytes.Reader
+	entered  chan struct{}
+	release  <-chan struct{}
+	readOnce sync.Once
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	r.readOnce.Do(func() { close(r.entered) })
+	<-r.release
+	return r.reader.Read(p)
+}
+
 func TestFlateEncodeConcurrentDistinctStreams(t *testing.T) {
 	f := newFlateFilter(t)
 	inputs := make([][]byte, 16)
@@ -85,49 +99,50 @@ func TestFlateEncodeConcurrentDistinctStreams(t *testing.T) {
 		inputs[i] = []byte(strings.Repeat(string(rune('a'+i)), 256))
 	}
 
+	release := make(chan struct{})
+	readers := make([]*gatedReader, len(inputs))
 	encoded := make([]io.Reader, len(inputs))
-	errs := make(chan error, len(inputs))
+	encodeErrs := make([]error, len(inputs))
 	var wg sync.WaitGroup
 	for i := range inputs {
+		readers[i] = &gatedReader{
+			reader:  bytes.NewReader(inputs[i]),
+			entered: make(chan struct{}),
+			release: release,
+		}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			var err error
-			encoded[i], err = f.Encode(bytes.NewReader(inputs[i]))
-			if err != nil {
-				errs <- err
-			}
+			encoded[i], encodeErrs[i] = f.Encode(readers[i])
 		}(i)
 	}
-	wg.Wait()
-	for i := range encoded {
-		if encoded[i] == nil {
-			continue
-		}
-		compressed, err := io.ReadAll(encoded[i])
-		if err != nil {
-			errs <- err
-			continue
-		}
-		decoded, err := f.Decode(bytes.NewReader(compressed))
-		if err != nil {
-			errs <- err
-			continue
-		}
-		got, err := io.ReadAll(decoded)
-		if err != nil {
-			errs <- err
-			continue
-		}
-		if !bytes.Equal(got, inputs[i]) {
-			errs <- errors.New("decoded concurrent stream differs from its input")
+
+	allEntered := true
+	timeout := time.NewTimer(5 * time.Second)
+waitForReaders:
+	for i := range readers {
+		select {
+		case <-readers[i].entered:
+		case <-timeout.C:
+			allEntered = false
+			break waitForReaders
 		}
 	}
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
+	timeout.Stop()
+	close(release)
+	wg.Wait()
+	if !allEntered {
+		t.Fatal("not all concurrent flate encodes reached their source reader")
+	}
+
+	for i := range encoded {
+		if encodeErrs[i] != nil {
+			t.Fatalf("encode stream %d: %v", i, encodeErrs[i])
 		}
+		if encoded[i] == nil {
+			t.Fatalf("encode stream %d returned a nil reader", i)
+		}
+		decodeFlate(t, f, encoded[i], inputs[i])
 	}
 }
 
