@@ -21,6 +21,7 @@ import (
 	"compress/zlib"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/pdfcpu/pdfcpu/pkg/log"
 	"github.com/pkg/errors"
@@ -56,6 +57,12 @@ type flate struct {
 	baseFilter
 }
 
+var flateWriterPool = sync.Pool{
+	New: func() any {
+		return zlib.NewWriter(io.Discard)
+	},
+}
+
 // Encode implements encoding for a Flate filter.
 func (f flate) Encode(r io.Reader) (io.Reader, error) {
 	if log.TraceEnabled() {
@@ -65,12 +72,18 @@ func (f flate) Encode(r io.Reader) (io.Reader, error) {
 	// TODO Optional decode parameters may need predictor preprocessing.
 
 	var b bytes.Buffer
-	w := zlib.NewWriter(&b)
-	defer w.Close()
+	w := flateWriterPool.Get().(*zlib.Writer)
+	w.Reset(&b)
 
 	written, err := io.Copy(w, r)
+	closeErr := w.Close()
+	w.Reset(io.Discard)
+	flateWriterPool.Put(w)
 	if err != nil {
 		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 
 	if log.TraceEnabled() {
